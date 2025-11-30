@@ -153,25 +153,28 @@ async function checkSystemStatus() {
 
 async function startCamera() {
     try {
-        // High resolution request
+        // Request 4:3 aspect ratio for better book scanning
         videoStream = await navigator.mediaDevices.getUserMedia({ 
-            video: { facingMode: 'environment', width: { ideal: 1920 }, height: { ideal: 1080 } } 
+            video: { 
+                facingMode: 'environment', 
+                width: { ideal: 2560 },  // 2K resolution
+                height: { ideal: 1920 }, // 4:3 aspect ratio
+                aspectRatio: { ideal: 4/3 }
+            } 
         });
         video.srcObject = videoStream;
         video.classList.remove('hidden');
         
         // UI Updates for Camera Mode
         cameraOverlay.classList.add('hidden');
-        previewImage.classList.add('hidden'); // Ensure preview is hidden
-        currentImage = null; // Clear current image
+        previewImage.classList.add('hidden');
+        currentImage = null;
         
-        // Button States
-        captureBtn.classList.remove('hidden'); // Show Capture
-        // IMPORTANT: Ensure upload button is visible
+        // Button States - Show only capture when camera active
+        captureBtn.classList.remove('hidden');
         uploadBtn.classList.remove('hidden');
-        
-        recaptureBtn.classList.add('hidden');  // Hide Re-capture
-        scanBtn.classList.add('hidden');       // Hide Scan
+        recaptureBtn.classList.add('hidden');
+        scanBtn.classList.add('hidden');
         
         isCameraActive = true;
         statusMessage.textContent = "Camera active. Click 'Capture' to take photo.";
@@ -182,6 +185,7 @@ async function startCamera() {
 }
 
 function capturePhoto() {
+    // Use actual video dimensions for capture
     canvas.width = video.videoWidth;
     canvas.height = video.videoHeight;
     const ctx = canvas.getContext('2d');
@@ -189,7 +193,7 @@ function capturePhoto() {
     
     canvas.toBlob(blob => {
         handleImageSelection(blob, URL.createObjectURL(blob));
-        stopCamera(false); // Stop stream but keep UI ready
+        stopCamera(false);
     }, 'image/jpeg', 0.9);
 }
 
@@ -204,7 +208,6 @@ function stopCamera(resetUI = true) {
     if (resetUI) {
         cameraOverlay.classList.remove('hidden');
         captureBtn.classList.add('hidden');
-        // Ensure upload button stays visible
         uploadBtn.classList.remove('hidden');
     }
 }
@@ -214,6 +217,8 @@ function handleFileSelect(e) {
     if (file && file.type.startsWith('image/')) {
         handleImageSelection(file, URL.createObjectURL(file));
     }
+    // Reset file input for re-selection of same file
+    e.target.value = '';
 }
 
 function handleImageSelection(blob, url) {
@@ -221,15 +226,14 @@ function handleImageSelection(blob, url) {
     previewImage.src = url;
     previewImage.classList.remove('hidden');
     
-    // UI Updates for Captured Mode
+    // UI Updates for Captured/Uploaded Mode
     cameraOverlay.classList.add('hidden');
     
-    captureBtn.classList.add('hidden');     // Hide Capture
-    // Ensure upload button stays visible
+    // Button states for captured image
+    captureBtn.classList.add('hidden');
     uploadBtn.classList.remove('hidden');
-    
-    recaptureBtn.classList.remove('hidden'); // Show Re-capture
-    scanBtn.classList.remove('hidden');      // Show Process Scan
+    recaptureBtn.classList.remove('hidden');
+    scanBtn.classList.remove('hidden');
     
     statusMessage.textContent = "Image ready. Click 'Process Scan' or 'Re-capture'.";
 }
@@ -270,19 +274,15 @@ async function processImage() {
         
         // SPLIT DISPLAY LOGIC
         if (data.results && data.results.length > 0) {
-            // 1. Top Result -> RED BOX
             displayMainResult(data.results[0]);
-            
-            // 2. Alternatives -> GREEN BOX
             displayAlternatives(data.results.slice(1));
-            
-            // Save to history
             addToHistory(data.results[0]);
         } else {
             resultsContainer.innerHTML = `
                 <div class="empty-state">
                     <div style="font-size:30px">🤔</div>
                     <div class="empty-state-text">No Matches Found</div>
+                    <div class="empty-state-subtext">Try adjusting the image or try a different book</div>
                 </div>
             `;
             alternativesContainer.innerHTML = '';
@@ -340,7 +340,7 @@ function displayAlternatives(books) {
 
     alternativesContainer.innerHTML = books.map((book, index) => `
         <div class="recent-item" onclick="promoteAlternative(${index})">
-            <div style="overflow:hidden; white-space:nowrap; text-overflow:ellipsis; margin-right:10px;">
+            <div style="overflow:hidden; white-space:nowrap; text-overflow:ellipsis; margin-right:10px; flex:1;">
                 ${book.title} <span style="color:#888; font-weight:normal;">- ${book.author}</span>
             </div>
             <div class="confidence-badge">${book.match_score}%</div>
@@ -358,13 +358,23 @@ window.promoteAlternative = function(index) {
 };
 
 window.clearAllResults = function() {
-    resultsContainer.innerHTML = '<div class="empty-state"><div class="empty-state-text">Cleared</div></div>';
-    alternativesContainer.innerHTML = '';
+    resultsContainer.innerHTML = `
+        <div class="empty-state" style="padding: 40px 0;">
+            <div style="font-size: 40px; margin-bottom: 10px;">📚</div>
+            <div class="empty-state-text">No Results</div>
+            <div class="empty-state-subtext">Scan a book cover to see details</div>
+        </div>
+    `;
+    alternativesContainer.innerHTML = `
+        <div style="color: var(--text-light); text-align: center; padding: 20px;">
+            Scan a book to see potential matches here.
+        </div>
+    `;
     previewImage.src = '';
     previewImage.classList.add('hidden');
     scanBtn.classList.add('hidden');
     recaptureBtn.classList.add('hidden');
-    // uploadBtn is always visible now
+    captureBtn.classList.add('hidden');
     cameraOverlay.classList.remove('hidden');
     currentImage = null;
     extractedTextDiv.style.display = 'none';
@@ -378,7 +388,7 @@ window.clearAllResults = function() {
 async function performManualSearch(query) {
     if (!query) return;
     
-    manualSearchResults.innerHTML = '<div style="text-align:center; padding:20px;">Searching...</div>';
+    manualSearchResults.innerHTML = '<div style="text-align:center; padding:40px; color:var(--text-medium);">Searching...</div>';
     
     try {
         const response = await fetch(`${API_BASE_URL}/search`, {
@@ -389,35 +399,86 @@ async function performManualSearch(query) {
         const data = await response.json();
         
         if (data.results.length === 0) {
-            manualSearchResults.innerHTML = '<div class="empty-state"><div class="empty-state-text">No matches found</div></div>';
-        } else {
-            manualSearchResults.innerHTML = data.results.map(book => `
-                <div class="result-card">
-                    <div class="result-header">
-                        <div class="book-title">${book.title}</div>
-                        <div style="font-weight:bold; color:var(--accent-blue)">${book.match_score}%</div>
-                    </div>
-                    <div class="result-details">
-                        <div class="detail-row"><span class="detail-label">Author</span><span>${book.author}</span></div>
-                        <div class="detail-row"><span class="detail-label">Category</span><span>${book.category}</span></div>
-                    </div>
+            manualSearchResults.innerHTML = `
+                <div class="empty-state">
+                    <div class="empty-state-icon">🔍</div>
+                    <div class="empty-state-text">No matches found</div>
+                    <div class="empty-state-subtext">Try a different search term</div>
                 </div>
-            `).join('');
+            `;
+        } else {
+            // Display search results WITH book images
+            manualSearchResults.innerHTML = data.results.map(book => {
+                const imageHtml = book.has_local_image && book.image_data
+                    ? `<img src="data:image/jpeg;base64,${book.image_data}" class="search-result-image">`
+                    : `<div class="search-result-image-placeholder">📖</div>`;
+                
+                return `
+                    <div class="result-card search-result-card">
+                        <div class="search-result-content">
+                            ${imageHtml}
+                            <div class="search-result-info">
+                                <div class="search-result-header">
+                                    <div class="book-title">${escapeHtml(book.title)}</div>
+                                    <div class="match-badge">${book.match_score}%</div>
+                                </div>
+                                <div class="search-result-author">by ${escapeHtml(book.author)}</div>
+                                <div class="search-result-details">
+                                    <span class="detail-chip">
+                                        <span class="detail-chip-label">Category</span>
+                                        ${escapeHtml(book.category)}
+                                    </span>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                `;
+            }).join('');
         }
     } catch (e) {
-        manualSearchResults.innerHTML = 'Error searching.';
+        manualSearchResults.innerHTML = `
+            <div class="empty-state">
+                <div class="empty-state-icon">⚠️</div>
+                <div class="empty-state-text">Error searching</div>
+                <div class="empty-state-subtext">Please try again</div>
+            </div>
+        `;
     }
 }
 
 function addToHistory(book) {
     let history = JSON.parse(localStorage.getItem('scanHistory') || '[]');
-    history.unshift({
+    
+    // Store book with image data (limit image size for localStorage)
+    const historyItem = {
         title: book.title,
         author: book.author,
-        date: new Date().toLocaleDateString()
-    });
-    history = history.slice(0, 20);
-    localStorage.setItem('scanHistory', JSON.stringify(history));
+        category: book.category || 'Unknown',
+        amazon_index: book.amazon_index || '',
+        date: new Date().toLocaleDateString(),
+        timestamp: new Date().toISOString(),
+        has_local_image: book.has_local_image,
+        image_data: book.image_data || null  // Store the image data
+    };
+    
+    history.unshift(historyItem);
+    
+    // Keep only last 30 items (reduced from 50 to account for image data size)
+    history = history.slice(0, 30);
+    
+    try {
+        localStorage.setItem('scanHistory', JSON.stringify(history));
+    } catch (e) {
+        // If localStorage is full, remove image data from older items
+        console.warn('localStorage might be full, trimming image data...');
+        history = history.map((item, index) => {
+            if (index > 5) {
+                return { ...item, image_data: null };
+            }
+            return item;
+        });
+        localStorage.setItem('scanHistory', JSON.stringify(history));
+    }
 }
 
 function loadHistory() {
@@ -427,22 +488,64 @@ function loadHistory() {
     const history = JSON.parse(localStorage.getItem('scanHistory') || '[]');
     
     if (history.length === 0) {
-        historyList.innerHTML = '<div class="empty-state"><div class="empty-state-text">No history yet</div></div>';
+        historyList.innerHTML = `
+            <div class="empty-state">
+                <div class="empty-state-icon">📖</div>
+                <div class="empty-state-text">No history yet</div>
+                <div class="empty-state-subtext">Your scanned books will appear here</div>
+            </div>
+        `;
         return;
     }
     
-    historyList.innerHTML = history.map(item => `
-        <div class="history-item">
-            <div class="history-item-info">
-                <div class="history-item-title">${item.title}</div>
-                <div class="history-item-meta">
-                    <span class="history-item-date">${item.date}</span>
-                    <span class="history-item-author">${item.author}</span>
+    historyList.innerHTML = history.map((item, index) => {
+        // Generate image HTML based on whether we have image data
+        const imageHtml = item.has_local_image && item.image_data
+            ? `<img src="data:image/jpeg;base64,${item.image_data}" class="history-item-image">`
+            : `<div class="history-item-image-placeholder">📚</div>`;
+        
+        return `
+            <div class="history-item" onclick="searchFromHistory('${escapeHtml(item.title)}')">
+                ${imageHtml}
+                <div class="history-item-info">
+                    <div class="history-item-title">${escapeHtml(item.title)}</div>
+                    <div class="history-item-meta">
+                        <span class="history-item-author">${escapeHtml(item.author)}</span>
+                        <span class="history-item-date">${item.date}</span>
+                    </div>
+                    <div class="history-item-category">${escapeHtml(item.category)}</div>
                 </div>
+                <div class="history-item-arrow">→</div>
             </div>
-        </div>
-    `).join('');
+        `;
+    }).join('');
 }
+
+// Helper function to escape HTML
+function escapeHtml(text) {
+    if (!text) return '';
+    const div = document.createElement('div');
+    div.textContent = text;
+    return div.innerHTML;
+}
+
+// Search from history item click
+window.searchFromHistory = function(title) {
+    showPage('search');
+    window.location.hash = 'search';
+    if (manualSearchInput) {
+        manualSearchInput.value = title;
+        performManualSearch(title);
+    }
+};
+
+// Clear history function
+window.clearHistory = function() {
+    if (confirm('Are you sure you want to clear all scan history?')) {
+        localStorage.removeItem('scanHistory');
+        loadHistory();
+    }
+};
 
 function showLoading(show) {
     const overlay = document.getElementById('loadingOverlay');

@@ -1,11 +1,12 @@
 """
-SMART OCR SYSTEM - Let the Model Do Its Thing!
+SMART OCR SYSTEM - Improved Noise Filtering + Better Search
 
-Strategy:
-1. Your custom model handles text recognition (what it's trained for)
-2. Tesseract handles text detection (finding where text is)
-3. OpenCV helps with preprocessing
-4. Everything works together seamlessly
+Improvements:
+1. Book region detection using edge detection
+2. Higher confidence thresholds for text detection
+3. Text filtering to remove noise (random characters, numbers)
+4. Focus on larger, more prominent text regions
+5. IMPROVED SEARCH: Partial matching, single word queries, fuzzy search
 """
 
 from flask import Flask, render_template, request, jsonify
@@ -52,6 +53,107 @@ STOP_WORDS = {
 }
 
 # ============================================================================
+# NOISE FILTERING UTILITIES
+# ============================================================================
+
+def is_valid_text(text):
+    """
+    Filter out noise text that's unlikely to be book title/author.
+    Returns True if text appears to be valid book-related text.
+    """
+    if not text or len(text) < 2:
+        return False
+    
+    text = text.strip()
+    
+    # Too short (likely noise)
+    if len(text) < 2:
+        return False
+    
+    # Too many numbers (likely serial numbers, dates picked up from background)
+    digit_ratio = sum(c.isdigit() for c in text) / len(text)
+    if digit_ratio > 0.5 and len(text) > 3:
+        return False
+    
+    # Random character sequences (no vowels = likely noise)
+    vowels = set('aeiouAEIOU')
+    if len(text) > 3:
+        vowel_count = sum(1 for c in text if c in vowels)
+        if vowel_count == 0:
+            return False
+    
+    # Filter out common noise patterns
+    noise_patterns = [
+        r'^[0-9]+$',           # Pure numbers
+        r'^[^a-zA-Z]+$',       # No letters at all
+        r'^[a-zA-Z]$',         # Single letter
+        r'^[0-9]{4,}',         # Long number sequences (years, codes)
+        r'^\W+$',              # Only special characters
+        r'^[A-Z]{1,2}[0-9]+',  # Codes like "A123", "FL1817"
+        r'^[0-9]+[A-Z]{1,2}$', # Codes like "1817FL"
+    ]
+    
+    for pattern in noise_patterns:
+        if re.match(pattern, text):
+            return False
+    
+    # Gibberish detection: too many consonant clusters
+    consonant_cluster = re.findall(r'[bcdfghjklmnpqrstvwxyzBCDFGHJKLMNPQRSTVWXYZ]{4,}', text)
+    if consonant_cluster and len(text) < 8:
+        return False
+    
+    return True
+
+
+def filter_text_results(results, min_confidence=40):
+    """
+    Filter OCR results to keep only valid text with good confidence.
+    """
+    filtered = []
+    for r in results:
+        if r['confidence'] >= min_confidence and is_valid_text(r['text']):
+            filtered.append(r)
+    return filtered
+
+
+def find_dominant_text_region(boxes, image_shape):
+    """
+    Find the main text region (likely the book cover) by analyzing
+    spatial distribution of detected text boxes.
+    """
+    if not boxes:
+        return None
+    
+    img_h, img_w = image_shape[:2]
+    img_center_x = img_w / 2
+    img_center_y = img_h / 2
+    
+    scored_boxes = []
+    
+    for box_data in boxes:
+        x, y, w, h = box_data['box']
+        
+        box_center_x = x + w / 2
+        box_center_y = y + h / 2
+        
+        dist_from_center = np.sqrt(
+            ((box_center_x - img_center_x) / img_w) ** 2 +
+            ((box_center_y - img_center_y) / img_h) ** 2
+        )
+        
+        size_score = (w * h) / (img_w * img_h)
+        center_score = 1 - dist_from_center
+        total_score = (size_score * 0.4) + (center_score * 0.4) + (box_data['confidence'] / 100 * 0.2)
+        
+        scored_boxes.append({
+            **box_data,
+            'score': total_score
+        })
+    
+    return scored_boxes
+
+
+# ============================================================================
 # CRNN MODEL
 # ============================================================================
 
@@ -84,22 +186,14 @@ class CRNN(nn.Module):
         return self.fc(rnn_out)
 
 # ============================================================================
-# SMART OCR ENGINE - Model Does Recognition, Tesseract Does Detection
+# SMART OCR ENGINE
 # ============================================================================
 
 class SmartOCR:
-    """
-    Division of Labor:
-    - Custom Model: Text recognition (reading words)
-    - Tesseract: Text detection (finding text locations)
-    - OpenCV: Image preprocessing
-    """
-    
     def __init__(self, model_path, device='cuda'):
         self.device = device if torch.cuda.is_available() else 'cpu'
         self.model_loaded = False
         
-        # Try to load custom model
         if os.path.exists(model_path):
             try:
                 checkpoint = torch.load(model_path, map_location=self.device)
@@ -125,31 +219,44 @@ class SmartOCR:
                 print(f"✅ Custom Model Ready on {self.device}")
             except Exception as e:
                 print(f"⚠️ Model load failed: {e}")
-                print("   → Will use Tesseract as fallback")
         else:
             print(f"⚠️ Model not found at {model_path}")
-            print("   → Will use Tesseract as fallback")
     
     def preprocess_image(self, image):
-        """OpenCV preprocessing for better OCR"""
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-        
-        # Denoise
-        denoised = cv2.fastNlMeansDenoising(gray)
-        
-        # Enhance contrast
+        denoised = cv2.fastNlMeansDenoising(gray, h=10)
         clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
         enhanced = clahe.apply(denoised)
-        
-        # Binarize
         _, binary = cv2.threshold(enhanced, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        
         return binary
     
-    def detect_text_boxes(self, image):
-        """Use Tesseract to find WHERE text is located"""
-        processed = self.preprocess_image(image)
+    def detect_book_region(self, image):
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+        edges = cv2.Canny(blurred, 50, 150)
+        contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         
+        if not contours:
+            return None
+        
+        img_area = image.shape[0] * image.shape[1]
+        best_rect = None
+        best_area = 0
+        
+        for contour in contours:
+            area = cv2.contourArea(contour)
+            if area < img_area * 0.1 or area > img_area * 0.95:
+                continue
+            peri = cv2.arcLength(contour, True)
+            approx = cv2.approxPolyDP(contour, 0.02 * peri, True)
+            if len(approx) >= 4 and area > best_area:
+                best_area = area
+                best_rect = cv2.boundingRect(contour)
+        
+        return best_rect
+    
+    def detect_text_boxes(self, image, book_region=None):
+        processed = self.preprocess_image(image)
         custom_config = r'--oem 3 --psm 11'
         data = pytesseract.image_to_data(processed, config=custom_config, output_type=Output.DICT)
         
@@ -160,23 +267,29 @@ class SmartOCR:
             conf = int(data['conf'][i])
             text = data['text'][i].strip()
             
-            if conf > 20 and len(text) > 0:  # Low threshold, we'll recognize later
+            if conf > 35 and len(text) > 0:
                 x, y, w, h = data['left'][i], data['top'][i], data['width'][i], data['height'][i]
                 
-                if w > 10 and h > 10:  # Filter tiny regions
+                if w > 15 and h > 12:
+                    if book_region:
+                        bx, by, bw, bh = book_region
+                        box_center_x = x + w / 2
+                        box_center_y = y + h / 2
+                        margin = 50
+                        if not (bx - margin <= box_center_x <= bx + bw + margin and
+                                by - margin <= box_center_y <= by + bh + margin):
+                            continue
+                    
                     boxes.append({
                         'box': (x, y, w, h),
-                        'tesseract_text': text,  # Keep as reference
+                        'tesseract_text': text,
                         'confidence': conf
                     })
         
         return boxes
     
     def recognize_text_in_box(self, image, box):
-        """Use YOUR MODEL to read text in a detected box"""
         x, y, w, h = box
-        
-        # Extract region with padding
         padding = 5
         x1 = max(0, x - padding)
         y1 = max(0, y - padding)
@@ -189,16 +302,13 @@ class SmartOCR:
             return None
         
         try:
-            # Convert to PIL and transform
             pil_img = Image.fromarray(cv2.cvtColor(region, cv2.COLOR_BGR2RGB))
             tensor = self.transform(pil_img).unsqueeze(0).to(self.device)
             
-            # Run YOUR MODEL
             with torch.no_grad():
                 output = self.model(tensor)
                 pred_indices = output.argmax(dim=2).squeeze(0)
                 
-                # CTC decode
                 chars = []
                 prev = None
                 for idx in pred_indices:
@@ -208,8 +318,6 @@ class SmartOCR:
                     prev = idx
                 
                 text = ''.join(chars).strip()
-                
-                # Calculate confidence
                 probs = torch.softmax(output, dim=2)
                 confidence = probs.max(dim=2)[0].mean().item() * 100
                 
@@ -223,31 +331,34 @@ class SmartOCR:
             return None
     
     def extract_text(self, image):
-        """
-        Main OCR pipeline:
-        1. Tesseract finds text locations
-        2. Your model reads the text
-        3. Tesseract fills in if model fails
-        """
+        print("📖 Attempting to detect book region...")
+        book_region = self.detect_book_region(image)
+        if book_region:
+            print(f"   Found book region: {book_region}")
+        else:
+            print("   No distinct book region found, using full image")
         
-        # Step 1: Find text boxes (Tesseract does this)
         print("🔍 Detecting text regions with Tesseract...")
-        boxes = self.detect_text_boxes(image)
-        print(f"   Found {len(boxes)} text regions")
+        boxes = self.detect_text_boxes(image, book_region)
+        print(f"   Found {len(boxes)} text regions (after initial filtering)")
         
         if not boxes:
             return {
                 'text': '',
                 'words': [],
+                'annotated_image': image,
                 'success': False,
-                'message': 'No text detected'
+                'message': 'No text detected',
+                'stats': {'custom_model': 0, 'tesseract': 0, 'total_words': 0}
             }
         
-        # Step 2: Recognize text in each box
+        scored_boxes = find_dominant_text_region(boxes, image.shape)
+        scored_boxes.sort(key=lambda x: x['score'], reverse=True)
+        
         results = []
         annotated_image = image.copy()
         
-        for i, box_data in enumerate(boxes):
+        for i, box_data in enumerate(scored_boxes):
             box = box_data['box']
             x, y, w, h = box
             
@@ -255,61 +366,63 @@ class SmartOCR:
             method_used = 'tesseract'
             confidence = box_data['confidence']
             
-            # Try custom model first (if loaded)
             if self.model_loaded:
                 result = self.recognize_text_in_box(image, box)
-                
                 if result and result['text'] and len(result['text']) > 0:
                     recognized_text = result['text']
                     confidence = result['confidence']
                     method_used = 'custom_model'
-                    print(f"   ✓ Model: '{recognized_text}' (conf: {confidence:.1f}%)")
             
-            # Fallback to Tesseract if model failed or not loaded
             if not recognized_text:
                 recognized_text = box_data['tesseract_text']
                 method_used = 'tesseract'
-                print(f"   → Tesseract: '{recognized_text}' (conf: {confidence}%)")
             
-            # Save result
             if recognized_text and len(recognized_text) > 0:
                 results.append({
                     'text': recognized_text,
                     'box': box,
                     'confidence': confidence,
-                    'method': method_used
+                    'method': method_used,
+                    'score': box_data.get('score', 0)
                 })
                 
-                # Draw box (color based on method)
-                color = (0, 255, 0) if method_used == 'custom_model' else (255, 0, 0)
+                color = (0, 255, 0) if method_used == 'custom_model' else (255, 165, 0)
                 cv2.rectangle(annotated_image, (x, y), (x+w, y+h), color, 2)
-                
-                # Add label
-                label = f"{recognized_text[:15]} ({method_used[0].upper()})"
-                cv2.putText(annotated_image, label, (x, y-5), 
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
         
-        # Step 3: Combine all text
-        full_text = " ".join([r['text'] for r in results])
+        print(f"🧹 Filtering results (before: {len(results)} words)...")
+        filtered_results = filter_text_results(results, min_confidence=40)
+        print(f"   After filtering: {len(filtered_results)} words")
         
-        # Stats
-        model_count = sum(1 for r in results if r['method'] == 'custom_model')
-        tesseract_count = len(results) - model_count
+        filtered_out = [r for r in results if r not in filtered_results]
+        if filtered_out:
+            print(f"   Filtered out: {[r['text'] for r in filtered_out]}")
+        
+        filtered_results.sort(key=lambda x: x.get('score', 0), reverse=True)
+        full_text = " ".join([r['text'] for r in filtered_results])
+        
+        for r in filtered_results:
+            x, y, w, h = r['box']
+            color = (0, 255, 0) if r['method'] == 'custom_model' else (0, 200, 255)
+            cv2.rectangle(annotated_image, (x, y), (x+w, y+h), color, 3)
+        
+        model_count = sum(1 for r in filtered_results if r['method'] == 'custom_model')
+        tesseract_count = len(filtered_results) - model_count
         
         print(f"\n📊 Recognition Stats:")
         print(f"   Custom Model: {model_count} words")
         print(f"   Tesseract: {tesseract_count} words")
-        print(f"   Total: '{full_text}'\n")
+        print(f"   Final text: '{full_text}'\n")
         
         return {
             'text': full_text,
-            'words': results,
+            'words': filtered_results,
             'annotated_image': annotated_image,
             'success': True,
             'stats': {
                 'custom_model': model_count,
                 'tesseract': tesseract_count,
-                'total_words': len(results)
+                'total_words': len(filtered_results),
+                'filtered_out': len(results) - len(filtered_results)
             }
         }
 
@@ -320,7 +433,7 @@ class SmartOCR:
 ocr_engine = SmartOCR(MODEL_PATH)
 
 # ============================================================================
-# BOOK DATABASE (Unchanged)
+# BOOK DATABASE - IMPROVED SEARCH
 # ============================================================================
 
 class BookDatabase:
@@ -381,6 +494,10 @@ class BookDatabase:
                 if col not in self.df.columns:
                     self.df[col] = ''
             
+            # Create lowercase versions for faster searching
+            self.df['title_lower'] = self.df['Title'].fillna('').astype(str).str.lower()
+            self.df['author_lower'] = self.df['Author'].fillna('').astype(str).str.lower()
+            
             self.loaded = True
             print(f"✓ Database Ready: {len(self.df)} books")
             return True
@@ -391,14 +508,23 @@ class BookDatabase:
         path = os.path.join(IMAGES_DIR, filename)
         return path if os.path.exists(path) else None
 
-    def clean_text(self, text):
+    def clean_text_for_ocr(self, text):
+        """Clean text for OCR matching - more strict, filters stop words"""
         if not isinstance(text, str): return []
         text = re.sub(r'[^a-zA-Z0-9\s]', ' ', text.lower())
         words = text.split()
         return [w for w in words if w not in STOP_WORDS and len(w) > 2]
+    
+    def clean_text_for_search(self, text):
+        """Clean text for manual search - less strict, keeps short words"""
+        if not isinstance(text, str): return []
+        text = re.sub(r'[^a-zA-Z0-9\s]', ' ', text.lower())
+        words = text.split()
+        # Keep words with 2+ characters for search
+        return [w for w in words if len(w) >= 2]
 
     def calculate_coverage(self, ocr_tokens, db_text):
-        db_tokens = self.clean_text(db_text)
+        db_tokens = self.clean_text_for_ocr(db_text)
         if not db_tokens: return 0
         hits = 0
         for db_word in db_tokens:
@@ -410,73 +536,243 @@ class BookDatabase:
                 hits += 1
         return (hits / len(db_tokens)) * 100
 
-    def search(self, ocr_text, max_results=20):
-        if not self.loaded or self.df is None: return []
-        
-        ocr_tokens = self.clean_text(ocr_text)
-        if not ocr_tokens: return []
-        
-        pattern = '|'.join([re.escape(t) for t in ocr_tokens])
-        mask = (
-            self.df['Title'].fillna('').astype(str).str.contains(pattern, case=False, regex=True) | 
-            self.df['Author'].fillna('').astype(str).str.contains(pattern, case=False, regex=True)
-        )
-        candidates = self.df[mask]
-        
-        if len(candidates) == 0:
+    def search(self, query_text, max_results=20):
+        """
+        IMPROVED SEARCH FUNCTION
+        - Supports single word queries
+        - Supports partial word matching (prefix search)
+        - Case-insensitive
+        - Fuzzy matching for typos
+        """
+        if not self.loaded or self.df is None: 
             return []
-
+        
+        query_text = query_text.strip().lower()
+        if not query_text:
+            return []
+        
+        print(f"🔍 Searching for: '{query_text}'")
+        
+        # Get search tokens (less strict - keeps short words)
+        search_tokens = self.clean_text_for_search(query_text)
+        
+        # Also keep the original query for partial matching
+        original_query = re.sub(r'[^a-zA-Z0-9\s]', '', query_text).strip()
+        
+        if not search_tokens and not original_query:
+            return []
+        
+        print(f"   Search tokens: {search_tokens}")
+        print(f"   Original query: '{original_query}'")
+        
         results = []
-        for idx, row in candidates.iterrows():
-            title = str(row.get('Title', ''))
-            author = str(row.get('Author', ''))
+        
+        # METHOD 1: Direct substring/partial match (for single words like "mind", "calc")
+        # This catches partial matches like "calc" -> "calculus"
+        if original_query:
+            mask_partial = (
+                self.df['title_lower'].str.contains(original_query, case=False, na=False, regex=False) |
+                self.df['author_lower'].str.contains(original_query, case=False, na=False, regex=False)
+            )
+            partial_matches = self.df[mask_partial]
+            print(f"   Partial matches found: {len(partial_matches)}")
             
-            author_score = self.calculate_coverage(ocr_tokens, author)
-            title_score = self.calculate_coverage(ocr_tokens, title)
-            
-            final_score = 0
-            matched_on = []
-            
-            if author_score > 80:
-                final_score += 60
-                matched_on.append('author')
-                if title_score > 20:
-                    final_score += title_score * 0.4
+            for idx, row in partial_matches.iterrows():
+                title = str(row.get('Title', ''))
+                author = str(row.get('Author', ''))
+                title_lower = row.get('title_lower', '')
+                author_lower = row.get('author_lower', '')
+                
+                # Calculate match score based on how well query matches
+                score = 0
+                matched_on = []
+                
+                # Check if query appears in title
+                if original_query in title_lower:
+                    # Higher score if query is at the start of a word
+                    words_in_title = title_lower.split()
+                    for word in words_in_title:
+                        if word.startswith(original_query):
+                            score += 80  # Prefix match
+                            break
+                        elif original_query in word:
+                            score += 60  # Substring match
+                            break
                     matched_on.append('title')
-                else:
-                    final_score += 10 
-            elif title_score > 50:
-                final_score += title_score
-                matched_on.append('title')
-                if author_score > 40:
-                    final_score += 20
+                
+                # Check if query appears in author
+                if original_query in author_lower:
+                    words_in_author = author_lower.split()
+                    for word in words_in_author:
+                        if word.startswith(original_query):
+                            score += 40
+                            break
+                        elif original_query in word:
+                            score += 30
+                            break
                     matched_on.append('author')
-            elif (title_score + author_score) > 80:
-                final_score = (title_score + author_score) / 2
-                matched_on.append('mixed')
-
-            if final_score >= 30:
+                
+                # Bonus for exact word match
+                if original_query in title_lower.split():
+                    score += 20
+                if original_query in author_lower.split():
+                    score += 10
+                
+                if score > 0:
+                    results.append({
+                        'title': title,
+                        'author': author,
+                        'category': row.get('Category', 'General'),
+                        'amazon_index': row.get('Amazon Index', ''),
+                        'match_score': min(100, score),
+                        'matched_on': matched_on,
+                        'row_idx': idx
+                    })
+        
+        # METHOD 2: Token-based matching (for multi-word queries)
+        if search_tokens:
+            # Build regex pattern for token matching
+            pattern = '|'.join([re.escape(t) for t in search_tokens])
+            
+            mask_tokens = (
+                self.df['title_lower'].str.contains(pattern, case=False, na=False, regex=True) |
+                self.df['author_lower'].str.contains(pattern, case=False, na=False, regex=True)
+            )
+            token_matches = self.df[mask_tokens]
+            print(f"   Token matches found: {len(token_matches)}")
+            
+            for idx, row in token_matches.iterrows():
+                # Skip if already added from partial matching
+                if any(r.get('row_idx') == idx for r in results):
+                    continue
+                
+                title = str(row.get('Title', ''))
+                author = str(row.get('Author', ''))
+                
+                author_score = self.calculate_coverage(search_tokens, author)
+                title_score = self.calculate_coverage(search_tokens, title)
+                
+                final_score = 0
+                matched_on = []
+                
+                if author_score > 80:
+                    final_score += 60
+                    matched_on.append('author')
+                    if title_score > 20:
+                        final_score += title_score * 0.4
+                        matched_on.append('title')
+                    else:
+                        final_score += 10
+                elif title_score > 50:
+                    final_score += title_score
+                    matched_on.append('title')
+                    if author_score > 40:
+                        final_score += 20
+                        matched_on.append('author')
+                elif (title_score + author_score) > 60:
+                    final_score = (title_score + author_score) / 2
+                    matched_on.append('mixed')
+                
+                if final_score >= 25:
+                    results.append({
+                        'title': title,
+                        'author': author,
+                        'category': row.get('Category', 'General'),
+                        'amazon_index': row.get('Amazon Index', ''),
+                        'match_score': int(final_score),
+                        'matched_on': matched_on,
+                        'row_idx': idx
+                    })
+        
+        # METHOD 3: Fuzzy matching for typos (if few results)
+        if len(results) < 5 and original_query and len(original_query) >= 3:
+            print(f"   Trying fuzzy matching...")
+            # Sample titles for fuzzy matching (limit for performance)
+            sample_size = min(10000, len(self.df))
+            sample_df = self.df.sample(n=sample_size) if len(self.df) > sample_size else self.df
+            
+            for idx, row in sample_df.iterrows():
+                if any(r.get('row_idx') == idx for r in results):
+                    continue
+                
+                title_lower = row.get('title_lower', '')
+                author_lower = row.get('author_lower', '')
+                
+                # Check fuzzy match on words
+                title_words = title_lower.split()
+                author_words = author_lower.split()
+                
+                fuzzy_score = 0
+                matched_on = []
+                
+                for word in title_words:
+                    if len(word) >= 3:
+                        ratio = difflib.SequenceMatcher(None, original_query, word).ratio()
+                        if ratio > 0.7:
+                            fuzzy_score = max(fuzzy_score, int(ratio * 70))
+                            if 'title' not in matched_on:
+                                matched_on.append('title')
+                
+                for word in author_words:
+                    if len(word) >= 3:
+                        ratio = difflib.SequenceMatcher(None, original_query, word).ratio()
+                        if ratio > 0.7:
+                            fuzzy_score = max(fuzzy_score, int(ratio * 50))
+                            if 'author' not in matched_on:
+                                matched_on.append('author')
+                
+                if fuzzy_score >= 40:
+                    results.append({
+                        'title': str(row.get('Title', '')),
+                        'author': str(row.get('Author', '')),
+                        'category': row.get('Category', 'General'),
+                        'amazon_index': row.get('Amazon Index', ''),
+                        'match_score': fuzzy_score,
+                        'matched_on': matched_on,
+                        'row_idx': idx
+                    })
+        
+        # Remove duplicates and sort by score
+        seen_titles = set()
+        unique_results = []
+        for r in results:
+            title_key = r['title'].lower()
+            if title_key not in seen_titles:
+                seen_titles.add(title_key)
+                unique_results.append(r)
+        
+        unique_results.sort(key=lambda x: x['match_score'], reverse=True)
+        
+        # Add image data to top results
+        final_results = []
+        for r in unique_results[:max_results]:
+            # Get image data
+            row_idx = r.get('row_idx')
+            if row_idx is not None and row_idx in self.df.index:
+                row = self.df.loc[row_idx]
                 image_path = self.get_image_path(row.get('Filename'))
                 img_data = None
                 if image_path:
                     try:
                         with open(image_path, 'rb') as f:
                             img_data = base64.b64encode(f.read()).decode('utf-8')
-                    except: pass
-
-                results.append({
-                    'title': title,
-                    'author': author,
-                    'category': row.get('Category', 'General'),
-                    'amazon_index': row.get('Amazon Index', ''),
-                    'match_score': int(final_score),
-                    'matched_on': matched_on,
-                    'has_local_image': image_path is not None,
-                    'image_data': img_data
-                })
+                    except: 
+                        pass
+                
+                r['has_local_image'] = image_path is not None
+                r['image_data'] = img_data
+            else:
+                r['has_local_image'] = False
+                r['image_data'] = None
+            
+            # Remove internal tracking field
+            if 'row_idx' in r:
+                del r['row_idx']
+            
+            final_results.append(r)
         
-        results.sort(key=lambda x: x['match_score'], reverse=True)
-        return results[:max_results]
+        print(f"   Final results: {len(final_results)}")
+        return final_results
 
     def get_stats(self):
         if not self.loaded: return {}
@@ -515,16 +811,13 @@ def scan():
     image = cv2.imdecode(img_bytes, cv2.IMREAD_COLOR)
     
     try:
-        # Use smart OCR (model + tesseract fallback)
         ocr_result = ocr_engine.extract_text(image)
         
         if not ocr_result['success']:
             return jsonify({'error': ocr_result['message']}), 500
         
-        # Search database
         results = book_db.search(ocr_result['text'])
         
-        # Encode annotated image
         _, buffer = cv2.imencode('.jpg', ocr_result['annotated_image'])
         annotated_base64 = base64.b64encode(buffer).decode('utf-8')
         
@@ -532,7 +825,7 @@ def scan():
             'success': True,
             'extracted_text': ocr_result['text'],
             'annotated_image': annotated_base64,
-            'cleaned_query': " ".join(book_db.clean_text(ocr_result['text'])),
+            'cleaned_query': " ".join(book_db.clean_text_for_search(ocr_result['text'])),
             'results': results,
             'ocr_stats': ocr_result['stats']
         })
