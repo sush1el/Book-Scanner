@@ -75,19 +75,17 @@ git clone https://github.com/yourusername/BookLens.git
 cd BookLens
 ```
 
-### 2. Extract the Dataset
+### 2. Download the Dataset
 
-The book cover dataset is provided as `Dataset.zip`. Extract it to create the required folder structure:
+The book cover dataset is hosted on Kaggle. You'll need to download it manually:
 
-```bash
-# On Windows (PowerShell)
-Expand-Archive -Path Dataset.zip -DestinationPath .
+1. **Go to Kaggle**: [Book Cover Dataset](https://www.kaggle.com/datasets/mexwell/book-cover-dataset)
+2. **Download** the dataset (you may need a Kaggle account)
+3. **Extract** the downloaded zip file
+4. **Rename** the extracted folder to `Book_Cover_Dataset`
+5. **Move** it into your project root directory
 
-# On macOS/Linux
-unzip Dataset.zip
-```
-
-After extraction, your folder structure should look like this:
+After setup, your folder structure should look like this:
 
 ```
 BookLens/
@@ -110,7 +108,6 @@ BookLens/
 ├── .gitignore
 ├── app.py
 ├── best_ocr_model.pth              # Pre-trained CRNN model
-├── Dataset.zip
 ├── requirements.txt
 ├── setup.bat                       # Windows setup script
 └── setup.sh                        # macOS/Linux setup script
@@ -182,7 +179,9 @@ source venv/bin/activate
 pip install --upgrade pip
 pip install -r requirements.txt
 
-# 4. Extract Dataset.zip to create Book_Cover_Dataset folder
+# 4. Download dataset from Kaggle:
+#    https://www.kaggle.com/datasets/mexwell/book-cover-dataset
+#    Extract and rename folder to "Book_Cover_Dataset"
 
 # 5. Run the application
 python app.py
@@ -310,7 +309,7 @@ self.device = 'cpu'
 
 ### Database Not Loading
 
-**Solution**: Ensure `Dataset.zip` is extracted correctly and the `Book_Cover_Dataset` folder contains CSV files.
+**Solution**: Ensure you've downloaded the dataset from [Kaggle](https://www.kaggle.com/datasets/mexwell/book-cover-dataset), extracted it, and renamed the folder to `Book_Cover_Dataset`. The folder should contain CSV files and a `224x224` subfolder with images.
 
 ### Camera Not Working
 
@@ -342,15 +341,7 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 ## 🙏 Acknowledgments
 
 - [Tesseract OCR](https://github.com/tesseract-ocr/tesseract) - Open source OCR engine
-- [Book Cover Dataset](https://github.com/uchidalab/book-dataset) - Book cover image dataset
+- [Book Cover Dataset](https://www.kaggle.com/datasets/mexwell/book-cover-dataset) - Book cover image dataset on Kaggle
 - [PyTorch](https://pytorch.org/) - Deep learning framework
 
 ---
-
-## 📧 Contact
-
-For questions or support, please open an issue on GitHub.
-
----
-
-<p align="center">Made with ❤️ for book lovers</p>
